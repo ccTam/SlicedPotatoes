@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #0c0d10;
+            overflow: hidden;
+        }
+
+        #chart {
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="chart"></div>
+    <script>
+        const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+            layout: { background: { type: 'solid', color: '#0c0d10' }, textColor: '#d1d4dc' },
+            grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+            timeScale: { borderColor: '#485c7b', timeVisible: true },
+        });
+
+        // --- 1. PRICE & TREND (Main Pane) ---
+        const candleSeries = chart.addCandlestickSeries({
+            // Up (Bullish) - Hollow effect
+            upColor: 'transparent',       // Make the body hollow
+            borderUpColor: '#26a69a',     // Keep the green border
+            wickUpColor: '#26a69a',       // Keep the green wick
+
+            // Down (Bearish) - Filled
+            downColor: '#ef5350',         // Filled red body
+            borderDownColor: '#ef5350',   // Red border
+            wickDownColor: '#ef5350',     // Red wick
+
+            borderVisible: true,          // MUST be true for hollow candles to have an outline
+        });
+        const emaSeries = chart.addLineSeries({ color: '#FFFFFF', lineWidth: 2, title: 'EMA 20' });
+
+        // ICHIMOKU
+        const tenkanSeries = chart.addLineSeries({ color: '#F44336', lineWidth: 1, title: 'Tenkan' });
+        const kijunSeries = chart.addLineSeries({ color: '#880E4F', lineWidth: 1, title: 'Kijun' });
+
+        // --- 2. ATR (VOLATILITY) ---
+        const atrSeries = chart.addLineSeries({ color: '#9c27b0', priceScaleId: 'atrScale', title: 'ATR' });
+
+        // --- 3. RSI ---
+        const rsiSeries = chart.addLineSeries({ color: '#7e57c2', lineWidth: 2, priceScaleId: 'rsiScale', title: 'RSI' });
+        rsiSeries.createPriceLine({ price: 70, color: '#ef5350', lineWidth: 1, lineStyle: 1 });
+        rsiSeries.createPriceLine({ price: 30, color: '#26a69a', lineWidth: 1, lineStyle: 1 });
+
+        // --- 4. STOCHASTIC RSI ---
+        const stochKSeries = chart.addLineSeries({ color: '#2196F3', lineWidth: 1, priceScaleId: 'stochScale', title: 'Stoch K' });
+        const stochDSeries = chart.addLineSeries({ color: '#FF9800', lineWidth: 1, priceScaleId: 'stochScale', title: 'Stoch D' });
+        stochKSeries.createPriceLine({ price: 80, color: '#ef5350', lineWidth: 1, lineStyle: 1 });
+        stochKSeries.createPriceLine({ price: 20, color: '#26a69a', lineWidth: 1, lineStyle: 1 });
+
+        // --- PANE LAYOUT ---
+        chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.6 } });
+        chart.priceScale('atrScale').applyOptions({ scaleMargins: { top: 0.45, bottom: 0.45 } });
+        chart.priceScale('rsiScale').applyOptions({ scaleMargins: { top: 0.60, bottom: 0.25 } });
+        chart.priceScale('stochScale').applyOptions({ scaleMargins: { top: 0.80, bottom: 0.05 } });
+
+        function loadData(jsonString) {
+            try {
+                const data = JSON.parse(jsonString);
+                candleSeries.setData(data);
+                emaSeries.setData(data.map(d => ({ time: d.time, value: d.ema })));
+                atrSeries.setData(data.map(d => ({ time: d.time, value: d.atr })));
+                rsiSeries.setData(data.map(d => ({ time: d.time, value: d.rsi })));
+                stochKSeries.setData(data.map(d => ({ time: d.time, value: d.stochK })));
+                stochDSeries.setData(data.map(d => ({ time: d.time, value: d.stochD })));
+
+                // DATA MAPPING FOR ICHIMOKU
+                tenkanSeries.setData(data.map(d => ({ time: d.time, value: d.tenkan })));
+                kijunSeries.setData(data.map(d => ({ time: d.time, value: d.kijun })));
+
+                const spikeMarkers = data
+                    .filter(d => d.volatilitySpike === true) // Only bars where spike is true
+                    .map(d => ({
+                        time: d.time,
+                        position: 'aboveBar',
+                        shape: 'circle',
+                        color: '#ff5252', // Bright Red
+                        text: 'S',
+                        size: 1
+                    }));
+                atrSeries.setMarkers(spikeMarkers);
+
+                chart.timeScale().fitContent();
+            } catch (e) { console.error(e); }
+        }
+
+        function updateRealtime(jsonString) {
+            try {
+                const d = JSON.parse(jsonString);
+                candleSeries.update({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close });
+                emaSeries.update({ time: d.time, value: d.ema });
+                atrSeries.update({ time: d.time, value: d.atr });
+                rsiSeries.update({ time: d.time, value: d.rsi });
+                stochKSeries.update({ time: d.time, value: d.stochK });
+                stochDSeries.update({ time: d.time, value: d.stochD });
+
+                // REAL-TIME UPDATE FOR ICHIMOKU
+                tenkanSeries.update({ time: d.time, value: d.tenkan });
+                kijunSeries.update({ time: d.time, value: d.kijun });
+            } catch (err) { console.error(err); }
+        }
+
+        window.addEventListener('resize', () => {
+            chart.applyOptions({ width: window.innerWidth, height: window.innerHeight });
+        });
+    </script>
+</body>
+
+</html>
