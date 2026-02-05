@@ -66,7 +66,7 @@ public class TradingViewBot extends Application {
             }
         });
 
-        stage.setTitle(String.format("[K] Ta (%s)-%dm", PAIR, INTERVAL));
+        stage.setTitle(String.format("[K] %s_%dm", PAIR, INTERVAL));
         stage.setScene(new Scene(webView, 1200, 800));
         stage.show();
     }
@@ -202,6 +202,7 @@ public class TradingViewBot extends Application {
             update.put("ema", ema20.getValue(i).doubleValue());
             update.put("rsi", rsi14.getValue(i).doubleValue());
             update.put("atr", currentAtr);
+            update.put("atr", atr14.getValue(i).doubleValue());
             update.put("tenkan", tenkan.getValue(i).doubleValue());
             update.put("kijun", kijun.getValue(i).doubleValue());
             update.put("stochK", stochK.getValue(i).doubleValue() * 100);

@@ -6,7 +6,8 @@ let chart,
   stochKSeries,
   stochDSeries,
   tenkanSeries,
-  kijunSeries;
+  kijunSeries,
+  latestData = null; // To store the most recent values
 
 function initChart() {
   chart = LightweightCharts.createChart(document.getElementById("chart"), {
@@ -92,39 +93,50 @@ function initChart() {
 function updateRealtime(jsonString) {
   try {
     setConnectionStatus(true);
+    if (!jsonString) return;
+
     const d = JSON.parse(jsonString);
+
+    // 1. Robust Time Extraction
     const t =
       typeof d.time === "object" && d.time !== null
         ? d.time.seconds || d.time.epochSecond
         : d.time;
 
-    // Update OHLC
-    candleSeries.update({
-      time: t,
-      open: d.open,
-      high: d.high,
-      low: d.low,
-      close: d.close,
-    });
+    if (!t) {
+      console.warn("Received update without timestamp:", d);
+      return;
+    }
 
-    // Update Overlays
-    if (d.ema !== undefined) emaSeries.update({ time: t, value: d.ema });
-    if (d.tenkan !== undefined)
-      tenkanSeries.update({ time: t, value: d.tenkan });
-    if (d.kijun !== undefined) kijunSeries.update({ time: t, value: d.kijun });
+    // 2. Update OHLC (Only if data exists)
+    if (d.open && d.close) {
+      candleSeries.update({
+        time: t,
+        open: d.open,
+        high: d.high,
+        low: d.low,
+        close: d.close,
+      });
+    }
 
-    // Update Indicator Panes
-    if (d.atr !== undefined) atrSeries.update({ time: t, value: d.atr });
-    if (d.rsi !== undefined) rsiSeries.update({ time: t, value: d.rsi });
-    if (d.stochK !== undefined)
-      stochKSeries.update({ time: t, value: d.stochK });
-    if (d.stochD !== undefined)
-      stochDSeries.update({ time: t, value: d.stochD });
+    // 3. Update Indicators with Safety Checks (Prevents line 168 crashes)
+    const updateSeries = (series, val) => {
+      if (series && val !== undefined && val !== null) {
+        series.update({ time: t, value: val });
+      }
+    };
 
-    // Handle Live Signals (Avoid duplicates on same timestamp)
+    updateSeries(emaSeries, d.ema);
+    updateSeries(tenkanSeries, d.tenkan);
+    updateSeries(kijunSeries, d.kijun);
+    updateSeries(atrSeries, d.atr);
+    updateSeries(rsiSeries, d.rsi);
+    updateSeries(stochKSeries, d.stochK);
+    updateSeries(stochDSeries, d.stochD);
+
+    // 4. Handle Signals
     if (d.signal && d.signal !== "NONE") {
       const currentMarkers = candleSeries.getMarkers() || [];
-      // Only add if we don't already have a marker for this specific second
       if (!currentMarkers.find((m) => m.time === t)) {
         const newMarker = {
           time: t,
@@ -142,8 +154,8 @@ function updateRealtime(jsonString) {
       }
     }
 
-    // HANDLE LIVE ATR SPIKES
-    if (d.volatilitySpike) {
+    // 5. Handle Spikes
+    if (d.volatilitySpike === true) {
       const currentSpikes = atrSeries.getMarkers() || [];
       if (!currentSpikes.find((m) => m.time === t)) {
         atrSeries.setMarkers([
@@ -160,12 +172,21 @@ function updateRealtime(jsonString) {
       }
     }
 
-    // Live Price Line Color
-    candleSeries.applyOptions({
-      priceLineColor: d.close >= d.open ? "#26a69a" : "#ef5350",
-    });
+    // 6. Visual Polish
+    if (d.close && d.open) {
+      candleSeries.applyOptions({
+        priceLineColor: d.close >= d.open ? "#26a69a" : "#ef5350",
+      });
+    }
+    latestData = d;
   } catch (err) {
-    console.error("Realtime update failed:", err);
+    // This will now print the EXACT error and the data that caused it
+    if (jsonString && jsonString.length > 10) {
+      console.warn(
+        "Realtime skip (likely empty tick or warm-up):",
+        err.message,
+      );
+    }
   }
 }
 
@@ -213,6 +234,7 @@ function loadData(jsonString) {
     atrSeries.setMarkers(spikeMarkers);
 
     chart.timeScale().fitContent();
+    latestData = data[data.length - 1];
   } catch (e) {
     console.error(e);
   }
@@ -220,31 +242,68 @@ function loadData(jsonString) {
 
 function handleCrosshair(param) {
   const legendPrice = document.getElementById("price-legend");
-  if (!param.time || !param.seriesData.size) return;
 
-  const candle = param.seriesData.get(candleSeries);
-  const ema = param.seriesData.get(emaSeries);
-  const atr = param.seriesData.get(atrSeries);
-  const rsi = param.seriesData.get(rsiSeries);
-  const k = param.seriesData.get(stochKSeries);
-  const d = param.seriesData.get(stochDSeries);
+  // Determine if we use the hover data or the "Latest" data
+  let isHovering = param && param.time && param.seriesData.size > 0;
+  let dataContext = null;
+  let ohlcContext = null;
 
-  if (candle) {
-    const color = candle.close >= candle.open ? "#26a69a" : "#ef5350";
-    legendPrice.innerHTML = `O <span style="color:${color}">${candle.open}</span> H <span style="color:${color}">${candle.high}</span> L <span style="color:${color}">${candle.low}</span> C <span style="color:${color}">${candle.close}</span>`;
+  if (isHovering) {
+    // We are hovering over a specific bar
+    ohlcContext = param.seriesData.get(candleSeries);
+    dataContext = {
+      ema: param.seriesData.get(emaSeries),
+      atr: param.seriesData.get(atrSeries),
+      rsi: param.seriesData.get(rsiSeries),
+      stochK: param.seriesData.get(stochKSeries),
+      stochD: param.seriesData.get(stochDSeries),
+    };
+  } else if (latestData) {
+    // Cursor is gone, use the most recent live data
+    ohlcContext = latestData;
+    dataContext = {
+      ema: latestData.ema,
+      atr: latestData.atr,
+      rsi: latestData.rsi,
+      stochK: latestData.stochK,
+      stochD: latestData.stochD,
+    };
   }
 
-  // Safety check for legend elements before updating
-  const updateVal = (id, val) => {
+  // Update OHLC Legend
+  if (ohlcContext && legendPrice) {
+    const color = ohlcContext.close >= ohlcContext.open ? "#26a69a" : "#ef5350";
+    legendPrice.innerHTML = `O <span style="color:${color}">${ohlcContext.open.toFixed(2)}</span> H <span style="color:${color}">${ohlcContext.high.toFixed(2)}</span> L <span style="color:${color}">${ohlcContext.low.toFixed(2)}</span> C <span style="color:${color}">${ohlcContext.close.toFixed(2)}</span>`;
+  }
+
+  // Update Indicator Values
+  const updateVal = (id, data) => {
     const el = document.getElementById(id);
-    if (el) el.innerText = val.toFixed(2);
+    if (!el) return;
+
+    let val = null;
+    if (data !== undefined && data !== null) {
+      // Handle both Hover objects (with .value) and latestData raw numbers
+      val =
+        typeof data === "object" && data.hasOwnProperty("value")
+          ? data.value
+          : data;
+    }
+
+    if (val !== null && val !== undefined && !isNaN(val)) {
+      el.innerText = val.toFixed(2);
+    } else {
+      el.innerText = "n/a";
+    }
   };
 
-  if (ema) updateVal("ema-val", ema.value);
-  if (atr) updateVal("atr-val", atr.value);
-  if (rsi) updateVal("rsi-val", rsi.value);
-  if (k) updateVal("stoch-k-val", k.value);
-  if (d) updateVal("stoch-d-val", d.value);
+  if (dataContext) {
+    updateVal("ema-val", dataContext.ema);
+    updateVal("atr-val", dataContext.atr);
+    updateVal("rsi-val", dataContext.rsi);
+    updateVal("stoch-k-val", dataContext.stochK);
+    updateVal("stoch-d-val", dataContext.stochD);
+  }
 }
 
 function setConnectionStatus(isConnected) {
