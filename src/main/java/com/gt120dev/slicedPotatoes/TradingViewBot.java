@@ -14,12 +14,10 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
 
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
@@ -27,30 +25,39 @@ import org.ta4j.core.*;
 import org.ta4j.core.indicators.*;
 import org.ta4j.core.indicators.helpers.ClosePriceIndicator;
 import org.ta4j.core.indicators.ichimoku.*;
+import javafx.concurrent.Worker;
+import javafx.scene.web.WebEngine;
 
 public class TradingViewBot extends Application {
+    private final String PAIR = "BTC/USD";
+    private final int INTERVAL = 15; // 1 Minute candles
+
     private WebSocketClient krakenWS;
-    private final BarSeries series = new BaseBarSeriesBuilder().withName("XBT_Data").build();
+    private BarSeries series;
     private final ObjectMapper mapper = new ObjectMapper();
+    private WebEngine webEngine;
 
     @Override
     public void start(Stage stage) {
         WebView webView = new WebView();
+        this.webEngine = webView.getEngine();
 
-        // Load the HTML file
         String url = getClass().getResource("/chart.html").toExternalForm();
-        webView.getEngine().load(url);
+        webEngine.load(url);
 
-        // Listen for page load success
-        webView.getEngine().getLoadWorker().stateProperty().addListener((obs, oldState, newState) -> {
-            if (newState == javafx.concurrent.Worker.State.SUCCEEDED) {
-                // Fetch data in a background thread to keep UI smooth
+        com.sun.javafx.webkit.WebConsoleListener.setDefaultListener((wv, msg, line, source) ->
+                System.out.println("JS => [" + source + ":" + line + "] " + msg)
+        );
+
+        webEngine.getLoadWorker().stateProperty().addListener((obs, oldState, newState) -> {
+            if (newState == Worker.State.SUCCEEDED) {
+                System.out.println("Engine Ready.");
                 new Thread(() -> {
                     try {
-                        String jsonData = fetchKrakenDataAsJson();
-                        // Push data to JavaScript on the JavaFX Application Thread
+                        String historicalData = fetchKrakenDataAsJson();
                         Platform.runLater(() -> {
-                            webView.getEngine().executeScript("loadData('" + jsonData + "')");
+                            runScript("loadData('" + historicalData + "')");
+                            initWebSocket();
                         });
                     } catch (Exception e) {
                         e.printStackTrace();
@@ -59,50 +66,39 @@ public class TradingViewBot extends Application {
             }
         });
 
-        // Debug JS errors in Java console
-        webView.getEngine().setOnError(event -> System.out.println("JS Error: " + event.getMessage()));
-        com.sun.javafx.webkit.WebConsoleListener.setDefaultListener((wv, msg, line, source) ->
-                System.out.println("JS Console: [" + source + ":" + line + "] " + msg)
-        );
-
-        webView.getEngine().getLoadWorker().stateProperty().addListener((obs, oldState, newState) -> {
-            if (newState == javafx.concurrent.Worker.State.SUCCEEDED) {
-                // 1. Fetch historical data first to fill the chart
-                String historicalData = fetchKrakenDataAsJson();
-                webView.getEngine().executeScript("loadData('" + historicalData + "')");
-
-                // 2. Start WebSocket for real-time updates
-                initWebSocket(webView);
-            }
-        });
-
-        stage.setTitle("Java T Bot - (Kraken)");
+        stage.setTitle(String.format("[K] Ta (%s)-%dm", PAIR, INTERVAL));
         stage.setScene(new Scene(webView, 1200, 800));
         stage.show();
     }
 
-    private void initWebSocket(WebView webView) {
+    private void runScript(String script) {
+        if (webEngine != null && webEngine.getLoadWorker().getState() == Worker.State.SUCCEEDED) {
+            webEngine.executeScript(script);
+        }
+    }
+
+    private void initWebSocket() {
         try {
             krakenWS = new WebSocketClient(new URI("wss://ws.kraken.com/v2")) {
                 @Override
                 public void onOpen(ServerHandshake handshakedata) {
-                    // Subscribe to 1-minute candles
-                    send("{\"method\":\"subscribe\",\"params\":{\"channel\":\"ohlc\",\"symbol\":[\"BTC/USD\"],\"interval\":1}}");
-                }
-
-                @Override
-                public void onMessage(String message) {
                     Platform.runLater(() -> {
-                        String processedUpdate = processWsMessage(message);
-                        if (processedUpdate != null) {
-                            // Use .update() instead of loadData to only refresh the last candle
-                            webView.getEngine().executeScript("updateRealtime('" + processedUpdate + "')");
-                        }
+                        runScript("setConnectionStatus(true);");
+                        send("{\"method\":\"subscribe\",\"params\":{\"channel\":\"ohlc\",\"symbol\":[\"" + PAIR + "\"],\"interval\":" + INTERVAL + "}}");
                     });
                 }
 
                 @Override
+                public void onMessage(String message) {
+                    String processedUpdate = processWsMessage(message);
+                    if (processedUpdate != null) {
+                        Platform.runLater(() -> runScript("updateRealtime('" + processedUpdate + "')"));
+                    }
+                }
+
+                @Override
                 public void onClose(int code, String reason, boolean remote) {
+                    Platform.runLater(() -> runScript("setConnectionStatus(false);"));
                 }
 
                 @Override
@@ -119,123 +115,153 @@ public class TradingViewBot extends Application {
     private String processWsMessage(String message) {
         try {
             JsonNode root = mapper.readTree(message);
-            if (!root.has("data")) return null;
+            // Safety check for channel
+            if (!root.has("channel") || !root.get("channel").asText().equals("ohlc")) return null;
 
-            JsonNode data = root.get("data").get(0);
-            // Convert WebSocket JSON to our Indicator format
-            // (Repeat your indicator calculation logic here for the latest bar)
+            JsonNode dataArray = root.get("data");
+            if (dataArray == null || dataArray.isEmpty()) return null;
+            JsonNode data = dataArray.get(0);
+
+            // 1. Time Handling & Alignment
+            String ts = data.has("interval_begin") ? data.get("interval_begin").asText() : data.get("timestamp").asText();
+            long epochSeconds = Instant.parse(ts).getEpochSecond();
+            long windowStart = (epochSeconds / (INTERVAL * 60)) * (INTERVAL * 60);
+            ZonedDateTime barTime = ZonedDateTime.ofInstant(Instant.ofEpochSecond(windowStart), ZoneId.systemDefault());
+
+            // 2. THE GATEKEEPER: Prevent ta4j "backwards in time" Exception
+            if (!series.isEmpty()) {
+                ZonedDateTime lastBarTime = series.getLastBar().getEndTime();
+                if (barTime.isBefore(lastBarTime)) {
+                    return null; // Ignore old data
+                }
+            }
+
+            // 3. Extract OHLC
+            double o = data.get("open").asDouble();
+            double h = data.get("high").asDouble();
+            double l = data.get("low").asDouble();
+            double c = data.get("close").asDouble();
+            double v = data.get("volume").asDouble();
+
+            // 4. Update Bar Series (Replace current bar or add new one)
+            boolean shouldReplace = !series.isEmpty() && series.getLastBar().getEndTime().isEqual(barTime);
+            Bar newBar = new BaseBar(Duration.ofMinutes(INTERVAL), barTime, o, h, l, c, v);
+            series.addBar(newBar, shouldReplace);
+
+            // 5. Initialize Indicators (Now in correct scope)
+            int i = series.getEndIndex();
+            ClosePriceIndicator closePrice = new ClosePriceIndicator(series);
+
+            EMAIndicator ema20 = new EMAIndicator(closePrice, 20);
+            RSIIndicator rsi14 = new RSIIndicator(closePrice, 14);
+            ATRIndicator atr14 = new ATRIndicator(series, 14);
+            SMAIndicator atrSMA = new SMAIndicator(atr14, 14);
+
+            IchimokuTenkanSenIndicator tenkan = new IchimokuTenkanSenIndicator(series, 9);
+            IchimokuKijunSenIndicator kijun = new IchimokuKijunSenIndicator(series, 26);
+
+            StochasticRSIIndicator stochRsi = new StochasticRSIIndicator(series, 14);
+            SMAIndicator stochK = new SMAIndicator(stochRsi, 3);
+            SMAIndicator stochD = new SMAIndicator(stochK, 3);
+
+            // 6. Build the JSON Update Object
             ObjectNode update = mapper.createObjectNode();
-            update.put("time", Instant.parse(data.get("timestamp").asText()).getEpochSecond());
-            update.put("open", data.get("open").asDouble());
-            update.put("high", data.get("high").asDouble());
-            update.put("low", data.get("low").asDouble());
-            update.put("close", data.get("close").asDouble());
 
-            // Re-calculate indicators with the new bar
-            // ... (Add your Indicator calculation calls here) ...
+            // Volatility Spike Logic
+            double currentAtr = atr14.getValue(i).doubleValue();
+            double avgAtr = atrSMA.getValue(i).doubleValue();
+            update.put("volatilitySpike", currentAtr > (avgAtr * 1.25));
+
+            // Signal Logic (Check enough data exists for Ichimoku/Crosses)
+            String signal = "NONE";
+            if (i > 1) {
+                double currentTenkan = tenkan.getValue(i).doubleValue();
+                double currentKijun = kijun.getValue(i).doubleValue();
+                double prevTenkan = tenkan.getValue(i - 1).doubleValue();
+                double prevKijun = kijun.getValue(i - 1).doubleValue();
+
+                // TK Cross Signal
+                if (currentTenkan > currentKijun && prevTenkan <= prevKijun) {
+                    signal = "BUY_TK";
+                } else if (currentTenkan < currentKijun && prevTenkan >= prevKijun) {
+                    signal = "SELL_TK";
+                }
+                // Pullback / Squeeze Logic
+                else if (rsi14.getValue(i).doubleValue() < 30 && stochK.getValue(i).doubleValue() < 0.2) {
+                    signal = "PULLBACK_BUY";
+                }
+            }
+            update.put("signal", signal);
+
+            // 7. Map Values to JSON for JavaScript
+            update.put("time", windowStart);
+            update.put("open", o);
+            update.put("high", h);
+            update.put("low", l);
+            update.put("close", c);
+            update.put("ema", ema20.getValue(i).doubleValue());
+            update.put("rsi", rsi14.getValue(i).doubleValue());
+            update.put("atr", currentAtr);
+            update.put("tenkan", tenkan.getValue(i).doubleValue());
+            update.put("kijun", kijun.getValue(i).doubleValue());
+            update.put("stochK", stochK.getValue(i).doubleValue() * 100);
+            update.put("stochD", stochD.getValue(i).doubleValue() * 100);
 
             return mapper.writeValueAsString(update);
+
         } catch (Exception e) {
+            System.err.println("Error processing WS message: " + e.getMessage());
             return null;
         }
     }
 
     private String fetchKrakenDataAsJson() {
         try {
-            // 1. Request data from Kraken (Public API - no key needed)
-            String pair = "XBTUSD";
-            String apiURL = "https://api.kraken.com/0/public/OHLC?pair=" + pair + "&interval=60";
-
+            String apiURL = "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=" + INTERVAL;
             HttpClient client = HttpClient.newHttpClient();
             HttpRequest request = HttpRequest.newBuilder().uri(URI.create(apiURL)).GET().build();
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-            // 2. Parse Kraken's nested structure
             JsonNode root = mapper.readTree(response.body());
-            // Note: Kraken uses internal names like XXBTZUSD for BTC/USD
             JsonNode result = root.get("result");
-            String internalName = result.fieldNames().next(); // Dynamically gets "XXBTZUSD"
+            String internalName = result.fieldNames().next();
             JsonNode dataArray = result.get(internalName);
 
-            // 3. Transform to TradingView Format
-            List<ObjectNode> sortedNodes = new ArrayList<>();
-            for (JsonNode node : dataArray) {
-                ObjectNode tvCandle = mapper.createObjectNode();
-                tvCandle.put("time", node.get(0).asLong());    // Time in seconds
-                tvCandle.put("open", node.get(1).asDouble());
-                tvCandle.put("high", node.get(2).asDouble());
-                tvCandle.put("low", node.get(3).asDouble());
-                tvCandle.put("close", node.get(4).asDouble());
-                sortedNodes.add(tvCandle);
-            }
+            this.series = new BaseBarSeriesBuilder().withName("XBT_Data").build();
 
-            // 4. Sort: Lightweight-charts REQUIRES ascending order
-            sortedNodes.sort(Comparator.comparingLong(n -> n.get("time").asLong()));
-
-            // 1. Create a ta4j BarSeries
-            BarSeries series = new BaseBarSeriesBuilder().withName("XBT_Data").build();
-
-            // 2. Load data into series and a list for JSON
             for (JsonNode node : dataArray) {
                 ZonedDateTime time = ZonedDateTime.ofInstant(Instant.ofEpochSecond(node.get(0).asLong()), ZoneId.systemDefault());
-                series.addBar(time, node.get(1).asDouble(), node.get(2).asDouble(), node.get(3).asDouble(), node.get(4).asDouble(), node.get(6).asDouble());
+                this.series.addBar(time, node.get(1).asDouble(), node.get(2).asDouble(), node.get(3).asDouble(), node.get(4).asDouble(), node.get(6).asDouble());
             }
 
-            // Calculate Indicators
+            // Indicators for historical data
             ClosePriceIndicator closePrice = new ClosePriceIndicator(series);
-            // Standard RSI (14 period)
-            RSIIndicator rsi = new RSIIndicator(closePrice, 14);
-            // Stochastic RSI (14 period)
-            StochasticRSIIndicator stochRsi = new StochasticRSIIndicator(series, 14);
-            // Trend: 20-period EMA
-            EMAIndicator emaTrend = new EMAIndicator(closePrice, 20);
-            // Volatility: ATR
-            ATRIndicator atr = new ATRIndicator(series, 14);
-            // Calculate a "Signal Line" for ATR to detect spikes (SMA of ATR)
-            SMAIndicator atrSMA = new SMAIndicator(atr, 14);
-
-            // Ichimoku
+            EMAIndicator ema20 = new EMAIndicator(closePrice, 20);
+            RSIIndicator rsi14 = new RSIIndicator(closePrice, 14);
+            ATRIndicator atr14 = new ATRIndicator(series, 14);
             IchimokuTenkanSenIndicator tenkan = new IchimokuTenkanSenIndicator(series, 9);
             IchimokuKijunSenIndicator kijun = new IchimokuKijunSenIndicator(series, 26);
-            // Smooth the Stoch RSI to get K and D lines (standard 3-period smoothing)
+            StochasticRSIIndicator stochRsi = new StochasticRSIIndicator(series, 14);
             SMAIndicator stochK = new SMAIndicator(stochRsi, 3);
             SMAIndicator stochD = new SMAIndicator(stochK, 3);
 
-            // 4. Combine into JSON
             ArrayNode rootArray = mapper.createArrayNode();
             for (int i = 0; i < series.getBarCount(); i++) {
-
-                double currentAtr = atr.getValue(i).doubleValue();
-                double averageAtr = atrSMA.getValue(i).doubleValue();
-
-
                 ObjectNode obj = mapper.createObjectNode();
                 obj.put("time", series.getBar(i).getEndTime().toEpochSecond());
                 obj.put("open", series.getBar(i).getOpenPrice().doubleValue());
                 obj.put("high", series.getBar(i).getHighPrice().doubleValue());
                 obj.put("low", series.getBar(i).getLowPrice().doubleValue());
                 obj.put("close", series.getBar(i).getClosePrice().doubleValue());
-
-                // Add indicator values
-                obj.put("ema", emaTrend.getValue(i).doubleValue());
-                obj.put("atr", atr.getValue(i).doubleValue());
-                obj.put("atr", currentAtr);
+                obj.put("ema", ema20.getValue(i).doubleValue());
+                obj.put("rsi", rsi14.getValue(i).doubleValue());
+                obj.put("atr", atr14.getValue(i).doubleValue());
                 obj.put("tenkan", tenkan.getValue(i).doubleValue());
                 obj.put("kijun", kijun.getValue(i).doubleValue());
-
-                // Convert 0.0-1.0 to 0-100
                 obj.put("stochK", stochK.getValue(i).doubleValue() * 100);
                 obj.put("stochD", stochD.getValue(i).doubleValue() * 100);
-
-                // RSI is already 0-100 in ta4j
-                obj.put("rsi", rsi.getValue(i).doubleValue());
-
-                boolean isSpike = currentAtr > (averageAtr * 1.25);
-                obj.put("volatilitySpike", isSpike);
-
                 rootArray.add(obj);
             }
-
             return mapper.writeValueAsString(rootArray);
         } catch (Exception e) {
             e.printStackTrace();
