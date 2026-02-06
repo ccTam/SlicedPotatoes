@@ -7,6 +7,8 @@ let chart,
   stochDSeries,
   tenkanSeries,
   kijunSeries,
+  spanASeries,
+  spanBSeries,
   latestData = null; // To store the most recent values
 
 function initChart() {
@@ -37,9 +39,22 @@ function initChart() {
   });
 
   // 2. Indicator Series (Overlays & Panes)
-  emaSeries = chart.addLineSeries({ color: "#E0E0E0FF", lineWidth: 1 });
-  tenkanSeries = chart.addLineSeries({ color: "#F44336", lineWidth: 1 });
-  kijunSeries = chart.addLineSeries({ color: "#880E4F", lineWidth: 1 });
+  emaSeries = chart.addLineSeries({ color: "#E0E0E0FF", lineWidth: 2 });
+  tenkanSeries = chart.addLineSeries({ color: "#dbff81", lineWidth: 1 });
+  kijunSeries = chart.addLineSeries({ color: "#4674ff", lineWidth: 2 });
+  // Cloud
+  // Edges of the cloud
+  spanASeries = chart.addLineSeries({
+    color: "rgba(38, 166, 154, 0.4)", // Greenish
+    lineWidth: 1,
+    lineStyle: 2, // Dashed look
+  });
+
+  spanBSeries = chart.addLineSeries({
+    color: "rgba(239, 83, 80, 0.4)", // Reddish
+    lineWidth: 1,
+    lineStyle: 2,
+  });
 
   atrSeries = chart.addLineSeries({
     color: "#9c27b0",
@@ -82,12 +97,16 @@ function initChart() {
     lineStyle: 2,
     axisLabelVisible: false,
   };
-  rsiSeries.createPriceLine({ ...thresholdStyle, price: 70 });
-  rsiSeries.createPriceLine({ ...thresholdStyle, price: 30 });
-  stochKSeries.createPriceLine({ ...thresholdStyle, price: 80 });
-  stochKSeries.createPriceLine({ ...thresholdStyle, price: 20 });
+  rsiSeries.createPriceLine({ ...thresholdStyle, lineStyle: 1, price: 70 });
+  rsiSeries.createPriceLine({ ...thresholdStyle, lineStyle: 1, price: 30 });
+  stochKSeries.createPriceLine({ ...thresholdStyle, lineStyle: 1, price: 80 });
+  stochKSeries.createPriceLine({ ...thresholdStyle, lineStyle: 1, price: 20 });
 
   chart.subscribeCrosshairMove(handleCrosshair);
+  chart.timeScale().applyOptions({
+    rightOffset: 35, // Leave room for the 26-bar shift + a little extra
+    barSpacing: 10,
+  });
 }
 
 function updateRealtime(jsonString) {
@@ -119,16 +138,20 @@ function updateRealtime(jsonString) {
       });
     }
 
-    // 3. Update Indicators with Safety Checks (Prevents line 168 crashes)
-    const updateSeries = (series, val) => {
+    // 3. Update Indicators with Safety Checks
+    const updateSeries = (series, val, timeOverride) => {
+      const targetTime = timeOverride || t;
       if (series && val !== undefined && val !== null) {
-        series.update({ time: t, value: val });
+        series.update({ time: targetTime, value: val });
       }
     };
 
     updateSeries(emaSeries, d.ema);
     updateSeries(tenkanSeries, d.tenkan);
     updateSeries(kijunSeries, d.kijun);
+    const futureT = t + 26 * INTERVAL * 60;
+    updateSeries(spanASeries, d.spanA, futureT);
+    updateSeries(spanBSeries, d.spanB, futureT);
     updateSeries(atrSeries, d.atr);
     updateSeries(rsiSeries, d.rsi);
     updateSeries(stochKSeries, d.stochK);
@@ -193,6 +216,8 @@ function updateRealtime(jsonString) {
 function loadData(jsonString) {
   try {
     const data = JSON.parse(jsonString);
+
+    // 1. Standard Price and Indicator Data
     candleSeries.setData(data);
     emaSeries.setData(data.map((d) => ({ time: d.time, value: d.ema })));
     atrSeries.setData(data.map((d) => ({ time: d.time, value: d.atr })));
@@ -202,8 +227,29 @@ function loadData(jsonString) {
     tenkanSeries.setData(data.map((d) => ({ time: d.time, value: d.tenkan })));
     kijunSeries.setData(data.map((d) => ({ time: d.time, value: d.kijun })));
 
-    // Historical Signal Markers
-    // 1. COMBINED CANDLE MARKERS (Signals + Squeeze)
+    // 2. The Cloud Logic (The 26-bar Shift)
+    const INTERVAL = 60; // Make sure this matches your Java INTERVAL (minutes)
+    const displacement = 26 * INTERVAL * 60; // 26 bars in seconds
+
+    // Filter out NaN/Zero values and apply shift
+    const spanAData = data
+      .filter((d) => d.spanA && d.spanA > 0)
+      .map((d) => ({
+        time: d.time + displacement,
+        value: d.spanA,
+      }));
+
+    const spanBData = data
+      .filter((d) => d.spanB && d.spanB > 0)
+      .map((d) => ({
+        time: d.time + displacement,
+        value: d.spanB,
+      }));
+
+    spanASeries.setData(spanAData);
+    spanBSeries.setData(spanBData);
+
+    // 3. Historical Signal Markers (Rest of your code stays same)
     const candleMarkers = data
       .filter((d) => d.signal && d.signal !== "NONE")
       .map((d) => ({
@@ -216,11 +262,11 @@ function loadData(jsonString) {
               ? "#26a69a"
               : "#ef5350",
         shape: d.signal.includes("BUY") ? "arrowUp" : "arrowDown",
-        text: d.signal === "PULLBACK_BUY" ? "SQUEEZE" : d.signal,
+        text: d.signal === "PULLBACK_BUY" ? "SQZ" : d.signal,
       }));
     candleSeries.setMarkers(candleMarkers);
 
-    // 2. ATR SPIKE MARKERS
+    // 4. ATR SPIKE MARKERS
     const spikeMarkers = data
       .filter((d) => d.volatilitySpike === true)
       .map((d) => ({
@@ -236,7 +282,7 @@ function loadData(jsonString) {
     chart.timeScale().fitContent();
     latestData = data[data.length - 1];
   } catch (e) {
-    console.error(e);
+    console.error("Error loading historical data:", e);
   }
 }
 
@@ -313,7 +359,7 @@ function setConnectionStatus(isConnected) {
 
   if (isConnected) {
     dot.classList.add("pulse-green");
-    text.innerText = "Live / WS";
+    text.innerText = "Live (WS)";
     text.style.color = "#26a69a";
   } else {
     dot.classList.remove("pulse-green");
